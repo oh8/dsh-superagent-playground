@@ -17,6 +17,37 @@ dsh-superagent 是跑在 DeepSeek Harness（DSH）里的主动式（proactive）
 | 执行器 | 每个 Ticket 一个 `dsh-superagent-worker` Session（id `worker-<ticketId>`）和目录；前台命令 5 秒转后台 job，便于随时接消息 |
 | 子代理 | worker 派生的 subagent 使用 DSH `standard` preset |
 
+### 组件关系
+
+```mermaid
+flowchart TB
+  sources["Sources<br/>GitHub / Feishu"]
+  panel["管理面板 :3082"]
+  engine["Engine<br/>Intake · Evals · Tickets · Replies"]
+  store[("SQLite")]
+  effects["Effects<br/>持久化副作用队列"]
+  outbox["Outbox<br/>回执与顺序"]
+  sessions["Sessions<br/>提示词 · 工具"]
+  executor["DshExecutor<br/>目录与 Session"]
+  main["主 Session"]
+  worker["worker Session"]
+
+  sources -->|"Trigger"| engine
+  panel -->|"HTTP"| engine
+  engine -->|"读写"| store
+  engine -->|enqueue| effects
+  effects --> sessions
+  effects --> executor
+  effects --> outbox
+  outbox -->|"发送"| sources
+  sessions --> main
+  sessions --> worker
+  executor --> worker
+  engine -->|"candidate"| main
+  main -->|"tools"| engine
+  worker -->|"tools"| engine
+```
+
 ## 3. 领域对象
 
 | 概念 | 中文 | 要点 |
@@ -73,6 +104,22 @@ sequenceDiagram
 - **明确请求**走另一条路：卡片以 `explicit` 到达主 Session，主 Session 用 `orchestrator_route` 批量决定 accept / attach / stop / ignore，不读代码、不做实现计划。
 - `accept` 在工具调用里完成：Engine 在**一个事务**内创建 Ticket、Mandate、订阅、首个 Assignment 和确认回复；`attach` 则把消息挂到已有 Ticket 并结束当前 Eval。
 
+两条路径合起来是：
+
+```mermaid
+flowchart LR
+  t["Trigger"] --> gate{"Gate（代码）"}
+  gate -->|"排除"| filtered["记录去向，不进 Eval"]
+  gate -->|"allowed + explicit"| explicit["明确请求"]
+  gate -->|"allowed + inferred"| inferred["主动候选"]
+  explicit --> route["主 Session<br/>orchestrator_route"]
+  inferred --> assess["主 Session<br/>orchestrator_eval / _read / _decide"]
+  route --> decision["Decision"]
+  assess --> decision
+  decision -->|accept| ticket["Ticket + Mandate<br/>+ 首个 Assignment"]
+  decision -->|"stop / ignore / unavailable"| recorded["记录决定"]
+```
+
 ### 4.3 派工与执行
 
 - Runtime 启动时恢复被中断的 Assignment；新 Assignment 经 `launch` effect 排队。
@@ -102,6 +149,27 @@ sequenceDiagram
 - 等所有 owner 都交还或结束后，消息才回到主 Session 成为候选；主 Session 对 follow-up 只能 stop，不能替 worker 接活。
 - 主 Session 可用 `orchestrator_ticket_note` 传一条事实（不超过 100 词），但备注不授予权限。
 
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as 人
+  participant S as Source
+  participant E as Engine
+  participant W as worker
+  participant M as 主 Session
+
+  P->>S: 在 Ticket 的 Thread 上发言
+  S->>E: Trigger
+  E->>W: 作为 Input 扇出（不重新评估）
+  alt 属于本 Ticket
+    W->>E: orchestrator_ack / 执行 / orchestrator_report
+  else 超出范围或属于别的 Ticket
+    W->>E: orchestrator_trigger_handback
+    E->>M: 所有 owner 都结束后成为候选
+    M->>E: orchestrator_route（accept / attach / ignore）
+  end
+```
+
 ## 5. 工具与 Engine 方法对照
 
 | Session | 工具 | 落到 | 效果 |
@@ -124,6 +192,46 @@ sequenceDiagram
 - 重启后 Session、目录、订阅、待发消息和已读记录都保留；运行中的 Assignment 带恢复说明重跑，等待人的照旧等待。
 - 暂停会停掉派发、新评估、超时和回复，但 Source 继续记录、正在跑的 turn 不打断；恢复后 Eval 截止时间顺延暂停时长。
 
+### Ticket 阶段
+
+```mermaid
+flowchart LR
+  accepted(["accept"]) --> queued["queued"]
+  queued -->|launch| working["working"]
+  working -->|"turn 结束"| idle["idle"]
+  idle -->|"新 Input"| working
+  working -->|需要人| person["person/*"]
+  person -->|"回答 / retry"| working
+  working -->|"dropped / stop"| ended["ended"]
+  person -->|"PR 关闭"| ended
+  ended -->|"人的消息 resume"| working
+```
+
+`person/*` 包含 `review`、`answer`、`blocked`、`failed`、`delivery` 五个子阶段，由最新 Report 和输入投递决定（见第 8 节）。人的 `stop` 可以从任何阶段结束 Ticket；已结束的 Ticket 收到人的消息会沿用原 Mandate 恢复，bot 与 CI 的消息不会。
+
+### 副作用队列
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant E as Engine
+  participant D as SQLite
+  participant F as Effects
+  participant H as handler
+  participant S as Source
+
+  E->>D: 事务内改聚合 + enqueue(kind, key)
+  Note over D: commit 之后才会执行
+  F->>D: 取最早到期的行（按 seq）
+  F->>H: run(kind, payload)
+  H->>S: 外部动作或写回 Engine
+  alt 成功
+    F->>D: 删除该行
+  else 失败
+    F->>D: 按退避更新 due，稍后重试
+  end
+```
+
 ## 7. 提示词与授权边界
 
 强弱顺序固定，提示词改不了代码强制的部分：
@@ -132,6 +240,25 @@ sequenceDiagram
 2. 内置与生成段：角色、订阅、回复、派发/工作、交接，以及每次请求重新生成的 Policy 段。
 3. 团队覆盖：Communication、Ticket scope、Delivery requirements 三段加团队技能。
 4. 外部文本：消息、评论、文档、引用，只是数据，永远不改变规则。
+
+每次请求的提示词按固定顺序拼装：
+
+```mermaid
+flowchart LR
+  subgraph first["第 1–4 段"]
+    direction LR
+    shared["共享说明 + 角色"] --> team["团队三段"]
+    team --> subs["订阅 / 回复"]
+    subs --> dispatch["派发（主）<br/>或工作说明（worker）"]
+  end
+  subgraph second["第 5–8 段"]
+    direction LR
+    admission["准入说明（仅主）"] --> handoff["交接说明"]
+    handoff --> env["执行环境变量"]
+    env --> policy["Policy 段"]
+  end
+  dispatch --> admission
+```
 
 每次模型请求都绑定当前提示词版本；保存提示词不重启、不打断 Session，执行器可以读回自己用过的版本。
 
